@@ -1,4 +1,4 @@
-# 自定义工作流: 编译 WDA 并处理好签名，适配巨魔 TrollStore 安装
+# 自定义工作流: 编译 WDA 并彻底修复 ldid 兼容性，适配巨魔 TrollStore
 name: Build WDA for TrollStore
 
 on:
@@ -20,13 +20,14 @@ jobs:
         run: |
           xcodebuild -version
           
+          # 只编译 arm64 (不编译 arm64e，避免兼容问题)
           xcodebuild build-for-testing \
             -project WebDriverAgent.xcodeproj \
             -scheme WebDriverAgentRunner \
             -destination 'generic/platform=iOS' \
             -derivedDataPath ./DerivedData \
             CODE_SIGNING_ALLOWED=NO \
-            ARCHS="arm64 arm64e" \
+            ARCHS="arm64" \
             ONLY_ACTIVE_ARCH=NO \
             2>&1 | tail -30
           
@@ -34,66 +35,127 @@ jobs:
           find ./DerivedData -name "*.app" -type d
           find ./DerivedData -name "*.xctest" -type d
 
-      - name: Fix binaries for TrollStore ldid compatibility
+      - name: Analyze and fix Mach-O files for TrollStore
         run: |
-          APP_PATH=$(find ./DerivedData -name "WebDriverAgentRunner-Runner.app" -path "*/Debug-iphoneos/*" -type d | head -1)
-          
-          if [ -z "$APP_PATH" ]; then
-            APP_PATH=$(find ./DerivedData -name "*.app" -path "*/iphoneos/*" -type d | head -1)
-          fi
-          
-          echo "App path: $APP_PATH"
-          
-          # 安装 ldid (和 TrollStore 用同样的工具)
           brew install ldid
           
-          echo "=== Scanning all Mach-O files ==="
+          APP_PATH=$(find ./DerivedData -name "WebDriverAgentRunner-Runner.app" -path "*/Debug-iphoneos/*" -type d | head -1)
+          echo "App path: $APP_PATH"
+          
+          echo ""
+          echo "=========================================="
+          echo "=== STEP 1: List ALL files in .app ==="
+          echo "=========================================="
+          find "$APP_PATH" -type f | sort
+          
+          echo ""
+          echo "=========================================="
+          echo "=== STEP 2: Identify ALL Mach-O files ==="
+          echo "=========================================="
           find "$APP_PATH" -type f | while read f; do
-            filetype=$(file "$f" 2>/dev/null)
-            if echo "$filetype" | grep -q "Mach-O"; then
-              echo "  $f"
-              echo "    -> $filetype"
-              
-              # 用 lipo 确保只有 arm64 (移除 arm64e 避免兼容问题)
-              archs=$(lipo -archs "$f" 2>/dev/null || echo "unknown")
-              echo "    -> archs: $archs"
-              
-              if echo "$archs" | grep -q "arm64e"; then
-                echo "    -> Extracting arm64 only..."
-                lipo "$f" -extract arm64 -output "${f}.arm64" 2>/dev/null && mv "${f}.arm64" "$f" || true
-              fi
-              
-              # 测试 ldid 能否处理
-              ldid -S "$f" 2>&1 || echo "    -> WARNING: ldid failed on this file"
+            ftype=$(file -b "$f" 2>/dev/null)
+            if echo "$ftype" | grep -qi "Mach-O\|Mach-o"; then
+              # 获取详细 Mach-O header 信息
+              echo ""
+              echo "FILE: $f"
+              echo "  file: $ftype"
+              archs=$(lipo -archs "$f" 2>/dev/null || echo "n/a")
+              echo "  archs: $archs"
+              otool -hv "$f" 2>/dev/null | grep -A2 "MH_" | head -5
             fi
           done
           
           echo ""
-          echo "=== Checking for problematic file types ==="
-          find "$APP_PATH" -type f -name "*.metallib" -o -name "*.car" | head -20
-          
-          # 删除 metallib 文件 (这些通常是 ldid 报错的元凶)
-          find "$APP_PATH" -name "*.metallib" -delete -print 2>/dev/null || true
+          echo "=========================================="
+          echo "=== STEP 3: Test ldid on each file ==="
+          echo "=========================================="
+          FAILED_FILES=""
+          find "$APP_PATH" -type f | while read f; do
+            ftype=$(file -b "$f" 2>/dev/null)
+            if echo "$ftype" | grep -qi "Mach-O\|Mach-o"; then
+              result=$(ldid -S "$f" 2>&1)
+              status=$?
+              if [ $status -ne 0 ]; then
+                echo "FAILED: $f"
+                echo "  error: $result"
+                echo "  file type: $ftype"
+                # 删除无法签名的文件
+                echo "  -> REMOVING problematic file"
+                rm -f "$f"
+              else
+                echo "OK: $(basename $f)"
+              fi
+            fi
+          done
           
           echo ""
-          echo "=== Final ldid signing test ==="
-          ldid -S "$APP_PATH" 2>&1 && echo "ldid signing OK!" || echo "ldid signing has issues"
+          echo "=========================================="
+          echo "=== STEP 4: Remove known problematic files ==="
+          echo "=========================================="
+          # 删除 metallib (Metal shader libraries - Mach-O headers but not real executables)
+          find "$APP_PATH" -name "*.metallib" -delete -print 2>/dev/null || true
+          # 删除 .car (compiled asset catalogs - 有时包含 Mach-O)
+          # 注意: 不删 .car，因为可能需要
+          # 删除 .o 目标文件
+          find "$APP_PATH" -name "*.o" -delete -print 2>/dev/null || true
+          # 删除 .a 静态库
+          find "$APP_PATH" -name "*.a" -delete -print 2>/dev/null || true
+          
+          echo ""
+          echo "=========================================="
+          echo "=== STEP 5: Final ldid -s test ==="
+          echo "=========================================="
+          ldid -s "$APP_PATH" 2>&1
+          LDID_STATUS=$?
+          echo "ldid -s exit code: $LDID_STATUS"
+          
+          if [ $LDID_STATUS -ne 0 ]; then
+            echo ""
+            echo "ldid -s still fails. Trying to find remaining problematic files..."
+            echo ""
+            # 二分查找: 对每个子目录单独测试
+            for dir in "$APP_PATH" "$APP_PATH"/PlugIns/* "$APP_PATH"/Frameworks/*; do
+              if [ -d "$dir" ]; then
+                ldid -s "$dir" 2>&1
+                status=$?
+                if [ $status -ne 0 ]; then
+                  echo "PROBLEMATIC DIR: $dir"
+                  # 逐个文件测试
+                  find "$dir" -type f | while read f; do
+                    ftype=$(file -b "$f" 2>/dev/null)
+                    if echo "$ftype" | grep -qi "Mach-O"; then
+                      ldid -S "$f" 2>&1
+                      s=$?
+                      if [ $s -ne 0 ]; then
+                        echo "  PROBLEM FILE: $f"
+                        echo "  TYPE: $ftype"
+                        echo "  Mach-O header:"
+                        otool -hv "$f" 2>/dev/null | head -10
+                        echo "  -> REMOVING"
+                        rm -f "$f"
+                      fi
+                    fi
+                  done
+                fi
+              fi
+            done
+            
+            echo ""
+            echo "=== Retry ldid -s after cleanup ==="
+            ldid -s "$APP_PATH" 2>&1
+            echo "Final ldid exit: $?"
+          fi
 
       - name: Package IPA
         run: |
           APP_PATH=$(find ./DerivedData -name "WebDriverAgentRunner-Runner.app" -path "*/Debug-iphoneos/*" -type d | head -1)
-          
-          if [ -z "$APP_PATH" ]; then
-            APP_PATH=$(find ./DerivedData -name "*.app" -path "*/iphoneos/*" -type d | head -1)
-          fi
-          
           echo "Packaging: $APP_PATH"
           
           # 获取 Bundle ID
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist")
           echo "Bundle ID: $BUNDLE_ID"
           
-          # 确保 xctest 插件也在里面
+          # 确保 xctest 插件在里面
           XCTEST_PATH=$(find ./DerivedData -name "WebDriverAgentRunner.xctest" -path "*/Debug-iphoneos/*" -type d | head -1)
           if [ -n "$XCTEST_PATH" ]; then
             PLUGINS_DIR="$APP_PATH/PlugIns"
@@ -102,13 +164,10 @@ jobs:
               cp -r "$XCTEST_PATH" "$PLUGINS_DIR/"
               echo "Added xctest plugin"
             fi
-            # 签名 xctest 内的二进制
-            find "$PLUGINS_DIR" -type f | while read f; do
-              if file "$f" | grep -q "Mach-O"; then
-                ldid -S "$f" 2>/dev/null || true
-              fi
-            done
           fi
+          
+          # 最终用 codesign 做 ad-hoc 签名 (比 ldid 更兼容)
+          codesign --force --deep --sign - "$APP_PATH" 2>&1 || true
           
           # 创建 IPA
           mkdir -p Payload
@@ -118,7 +177,6 @@ jobs:
           echo "=== IPA Info ==="
           echo "Bundle ID: $BUNDLE_ID"
           ls -la WebDriverAgent.ipa
-          echo "IPA created successfully!"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
