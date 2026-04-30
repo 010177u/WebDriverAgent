@@ -17,11 +17,12 @@ jobs:
           set -e
           mkdir -p iControl.app
 
-          # ===== main.m - 完整的独立控制App =====
           cat > main.m << 'MAIN_EOF'
           #import <UIKit/UIKit.h>
+          #import <AVFoundation/AVFoundation.h>
           #import <sys/socket.h>
           #import <netinet/in.h>
+          #import <sys/sysctl.h>
           #import <dlfcn.h>
           #import <objc/runtime.h>
           #import <ImageIO/ImageIO.h>
@@ -31,489 +32,584 @@ jobs:
           #include <errno.h>
           #include <pthread.h>
 
-          // ========== Private API Declarations ==========
-          // Screenshot - loaded dynamically via dlsym
+          // ===== Private API types =====
           typedef CGImageRef (*UIGetScreenImageFunc)(void);
-
-          // SpringBoard app launch
-          typedef void* FBSOpenApplicationServiceRef;
-          typedef void* BSMachPortTaskNameRight;
-
-          // Touch injection via IOKit HID
           typedef struct __IOHIDEvent *IOHIDEventRef;
           typedef uint32_t IOHIDDigitizerTransducerType;
+          typedef IOHIDEventRef (*CreateDigitizerFunc)(CFAllocatorRef,uint64_t,IOHIDDigitizerTransducerType,uint32_t,uint32_t,uint32_t,uint32_t,double,double,double,double,double,double,Boolean,Boolean,uint32_t);
+          typedef IOHIDEventRef (*CreateFingerFunc)(CFAllocatorRef,uint64_t,uint32_t,uint32_t,uint32_t,double,double,double,double,double,Boolean,Boolean,uint32_t);
+          typedef void (*AppendEventFunc)(IOHIDEventRef,IOHIDEventRef,uint32_t);
 
-          // All IOHIDEvent functions loaded dynamically via dlsym
-          typedef IOHIDEventRef (*IOHIDEventCreateDigitizerEventFunc)(
-              CFAllocatorRef, uint64_t, IOHIDDigitizerTransducerType,
-              uint32_t, uint32_t, uint32_t, uint32_t,
-              double, double, double, double, double, double,
-              Boolean, Boolean, uint32_t);
-
-          typedef IOHIDEventRef (*IOHIDEventCreateDigitizerFingerEventFunc)(
-              CFAllocatorRef, uint64_t,
-              uint32_t, uint32_t, uint32_t,
-              double, double, double, double, double,
-              Boolean, Boolean, uint32_t);
-
-          typedef void (*IOHIDEventAppendEventFunc)(IOHIDEventRef, IOHIDEventRef, uint32_t);
-          typedef void (*IOHIDEventSetIntegerValueFunc)(IOHIDEventRef, uint32_t, int);
-          typedef void (*IOHIDEventSetSenderIDFunc)(IOHIDEventRef, uint64_t);
-
-          // HID event fields
           #define kIOHIDDigitizerEventTouch     0x01
           #define kIOHIDDigitizerEventPosition  0x02
           #define kIOHIDDigitizerEventIdentity  0x20
           #define kIOHIDTransducerTypeFinger    2
 
-          // ========== Simple HTTP Server ==========
-          @interface HTTPServer : NSObject {
-              CFSocketRef _cfSocket;
-              int _serverFd;
+          // ===== Cached private API pointers =====
+          static UIGetScreenImageFunc g_getScreenImage = NULL;
+          static CreateDigitizerFunc g_createDigitizer = NULL;
+          static CreateFingerFunc g_createFinger = NULL;
+          static AppendEventFunc g_appendEvent = NULL;
+          static id g_bbsRouter = nil;
+          static SEL g_routeEventSel = NULL;
+
+          static void LoadPrivateAPIs(void) {
+              g_getScreenImage = (UIGetScreenImageFunc)dlsym(RTLD_DEFAULT, "UIGetScreenImage");
+              NSLog(@"iControl: UIGetScreenImage = %p", g_getScreenImage);
+
+              void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+              if (iokit) {
+                  g_createDigitizer = (CreateDigitizerFunc)dlsym(iokit, "IOHIDEventCreateDigitizerEvent");
+                  g_createFinger = (CreateFingerFunc)dlsym(iokit, "IOHIDEventCreateDigitizerFingerEvent");
+                  g_appendEvent = (AppendEventFunc)dlsym(iokit, "IOHIDEventAppendEvent");
+                  NSLog(@"iControl: IOHIDEvent funcs loaded: %p %p %p", g_createDigitizer, g_createFinger, g_appendEvent);
+              }
+
+              void *bbs = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
+              if (bbs) {
+                  Class cls = NSClassFromString(@"BKSHIDEventRouter");
+                  if (cls) {
+                      g_bbsRouter = [cls performSelector:@selector(sharedInstance)];
+                      g_routeEventSel = NSSelectorFromString(@"routeEvent:");
+                      NSLog(@"iControl: BBS router = %@", g_bbsRouter);
+                  }
+              }
           }
-          @property (nonatomic, strong) NSString *statusText;
-          @property (nonatomic, strong) NSThread *serverThread;
-          - (void)startOnPort:(int)port;
+
+          // ===== Background Keep-Alive =====
+          @interface BackgroundKeepAlive : NSObject
+          @property (nonatomic, strong) AVAudioPlayer *silentPlayer;
+          @property (nonatomic, strong) NSTimer *keepAliveTimer;
+          + (instancetype)shared;
+          - (void)start;
           @end
 
-          // ========== Device Control ==========
+          @implementation BackgroundKeepAlive
+          + (instancetype)shared {
+              static BackgroundKeepAlive *inst;
+              static dispatch_once_t onceToken;
+              dispatch_once(&onceToken, ^{ inst = [[self alloc] init]; });
+              return inst;
+          }
+
+          - (void)start {
+              NSError *err;
+              AVAudioSession *session = [AVAudioSession sharedInstance];
+              [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&err];
+              [session setActive:YES error:&err];
+              NSLog(@"iControl: AudioSession active, err=%@", err);
+
+              // Generate 1 second of silence as WAV
+              int sampleRate = 8000;
+              int numSamples = sampleRate;
+              int dataSize = numSamples * 2;
+              int fileSize = 44 + dataSize;
+              NSMutableData *wav = [NSMutableData dataWithCapacity:fileSize];
+              // WAV header
+              const char *riff = "RIFF"; [wav appendBytes:riff length:4];
+              int32_t chunkSize = fileSize - 8; [wav appendBytes:&chunkSize length:4];
+              const char *wave = "WAVE"; [wav appendBytes:wave length:4];
+              const char *fmt = "fmt "; [wav appendBytes:fmt length:4];
+              int32_t fmtSize = 16; [wav appendBytes:&fmtSize length:4];
+              int16_t audioFmt = 1; [wav appendBytes:&audioFmt length:2];
+              int16_t channels = 1; [wav appendBytes:&channels length:2];
+              int32_t sr = sampleRate; [wav appendBytes:&sr length:4];
+              int32_t byteRate = sampleRate * 2; [wav appendBytes:&byteRate length:4];
+              int16_t blockAlign = 2; [wav appendBytes:&blockAlign length:2];
+              int16_t bps = 16; [wav appendBytes:&bps length:2];
+              const char *data = "data"; [wav appendBytes:data length:4];
+              int32_t ds = dataSize; [wav appendBytes:&ds length:4];
+              // Silent samples
+              char silence[2] = {0, 0};
+              for (int i = 0; i < numSamples; i++) [wav appendBytes:silence length:2];
+
+              self.silentPlayer = [[AVAudioPlayer alloc] initWithData:wav error:&err];
+              self.silentPlayer.numberOfLoops = -1;
+              self.silentPlayer.volume = 0.01;
+              [self.silentPlayer play];
+              NSLog(@"iControl: Silent audio playing=%d", self.silentPlayer.isPlaying);
+
+              // Periodic background task renewal
+              self.keepAliveTimer = [NSTimer scheduledTimerWithTimeInterval:25.0 repeats:YES block:^(NSTimer *t) {
+                  UIBackgroundTaskIdentifier bgTask = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:nil];
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5*NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                      [[UIApplication sharedApplication] endBackgroundTask:bgTask];
+                  });
+              }];
+          }
+          @end
+
+          // ===== Device Control =====
           @interface DeviceControl : NSObject
-          + (NSData *)takeScreenshot;
+          + (NSData *)screenshotJPEG:(CGFloat)quality;
+          + (NSData *)screenshotPNG;
           + (void)tapAtX:(double)x y:(double)y;
-          + (void)swipeFromX:(double)fromX fromY:(double)fromY toX:(double)toX toY:(double)toY duration:(double)duration;
+          + (void)swipeFromX:(double)fx fromY:(double)fy toX:(double)tx toY:(double)ty duration:(double)d;
           + (void)pressHomeButton;
+          + (void)inputText:(NSString *)text;
+          + (void)openApp:(NSString *)bundleId;
           + (NSDictionary *)deviceInfo;
+          + (NSDictionary *)batteryInfo;
           + (CGSize)screenSize;
-          @end
-
-          // ========== App Delegate ==========
-          @interface AppDelegate : UIResponder <UIApplicationDelegate>
-          @property (strong, nonatomic) UIWindow *window;
-          @property (strong, nonatomic) HTTPServer *server;
-          @property (strong, nonatomic) UILabel *statusLabel;
           @end
 
           @implementation DeviceControl
 
-          + (NSData *)takeScreenshot {
-              // Dynamically load private API
-              UIGetScreenImageFunc getScreenImage = (UIGetScreenImageFunc)dlsym(RTLD_DEFAULT, "UIGetScreenImage");
-              CGImageRef cgImage = getScreenImage ? getScreenImage() : NULL;
-              if (!cgImage) {
-                  // Fallback: capture our own window
-                  UIWindow *window = nil;
-                  for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                      if (scene.activationState == UISceneActivationStateForegroundActive) {
-                          for (UIWindow *w in scene.windows) {
-                              if (w.isKeyWindow) { window = w; break; }
+          + (NSData *)screenshotJPEG:(CGFloat)quality {
+              __block NSData *result = nil;
+              void (^work)(void) = ^{
+                  @autoreleasepool {
+                      CGImageRef cg = g_getScreenImage ? g_getScreenImage() : NULL;
+                      if (cg) {
+                          UIImage *img = [UIImage imageWithCGImage:cg];
+                          CGImageRelease(cg);
+                          result = UIImageJPEGRepresentation(img, quality);
+                      } else {
+                          UIWindow *w = [self _findKeyWindow];
+                          if (w) {
+                              UIGraphicsBeginImageContextWithOptions(w.bounds.size, YES, 0);
+                              [w drawViewHierarchyInRect:w.bounds afterScreenUpdates:NO];
+                              UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+                              UIGraphicsEndImageContext();
+                              result = UIImageJPEGRepresentation(img, quality);
                           }
                       }
                   }
-                  if (!window) window = [UIApplication sharedApplication].windows.firstObject;
-                  UIGraphicsBeginImageContextWithOptions(window.bounds.size, NO, [UIScreen mainScreen].scale);
-                  [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:YES];
-                  UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
-                  UIGraphicsEndImageContext();
-                  return UIImagePNGRepresentation(image);
-              }
-              UIImage *image = [UIImage imageWithCGImage:cgImage];
-              CGImageRelease(cgImage);
-              return UIImagePNGRepresentation(image);
+              };
+              if ([NSThread isMainThread]) work();
+              else dispatch_sync(dispatch_get_main_queue(), work);
+              return result;
           }
 
-          + (void)sendTouchEventAtX:(double)x y:(double)y phase:(int)phase {
-              // Normalize coordinates to 0.0-1.0
-              CGSize size = [self screenSize];
-              double nx = x / size.width;
-              double ny = y / size.height;
-              
-              uint64_t timestamp = mach_absolute_time();
-              Boolean isTouching = (phase != 4); // 4 = ended
-              uint32_t eventMask = kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventPosition | kIOHIDDigitizerEventIdentity;
-
-              // Load IOHIDEvent functions dynamically
-              void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
-              IOHIDEventCreateDigitizerEventFunc createDigitizer = (IOHIDEventCreateDigitizerEventFunc)dlsym(iokit, "IOHIDEventCreateDigitizerEvent");
-              IOHIDEventCreateDigitizerFingerEventFunc createFinger = (IOHIDEventCreateDigitizerFingerEventFunc)dlsym(iokit, "IOHIDEventCreateDigitizerFingerEvent");
-              IOHIDEventAppendEventFunc appendEvent = (IOHIDEventAppendEventFunc)dlsym(iokit, "IOHIDEventAppendEvent");
-              
-              if (!createDigitizer || !createFinger || !appendEvent) return;
-
-              IOHIDEventRef digitizerEvent = createDigitizer(
-                  kCFAllocatorDefault, timestamp,
-                  kIOHIDTransducerTypeFinger,
-                  0, 1, eventMask, 0,
-                  nx, ny, 0,
-                  0, 0, 0,
-                  isTouching, isTouching, 0);
-
-              IOHIDEventRef fingerEvent = createFinger(
-                  kCFAllocatorDefault, timestamp,
-                  0, 1, eventMask,
-                  nx, ny, 0,
-                  0, 0,
-                  isTouching, isTouching, 0);
-
-              appendEvent(digitizerEvent, fingerEvent, 0);
-
-              // Try to send via BackBoardServices
-              void *bbs = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
-              if (bbs) {
-                  // Get BKSHIDEventRouter
-                  Class routerClass = NSClassFromString(@"BKSHIDEventRouter");
-                  if (routerClass) {
-                      id router = [routerClass performSelector:@selector(sharedInstance)];
-                      if (router) {
-                          SEL routeSel = NSSelectorFromString(@"routeEvent:");
-                          if ([router respondsToSelector:routeSel]) {
-                              #pragma clang diagnostic push
-                              #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                              [router performSelector:routeSel withObject:(__bridge id)digitizerEvent];
-                              #pragma clang diagnostic pop
+          + (NSData *)screenshotPNG {
+              __block NSData *result = nil;
+              void (^work)(void) = ^{
+                  @autoreleasepool {
+                      CGImageRef cg = g_getScreenImage ? g_getScreenImage() : NULL;
+                      if (cg) {
+                          UIImage *img = [UIImage imageWithCGImage:cg];
+                          CGImageRelease(cg);
+                          result = UIImagePNGRepresentation(img);
+                      } else {
+                          UIWindow *w = [self _findKeyWindow];
+                          if (w) {
+                              UIGraphicsBeginImageContextWithOptions(w.bounds.size, NO, 0);
+                              [w drawViewHierarchyInRect:w.bounds afterScreenUpdates:NO];
+                              UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+                              UIGraphicsEndImageContext();
+                              result = UIImagePNGRepresentation(img);
                           }
                       }
                   }
-              }
+              };
+              if ([NSThread isMainThread]) work();
+              else dispatch_sync(dispatch_get_main_queue(), work);
+              return result;
+          }
 
-              CFRelease(fingerEvent);
-              CFRelease(digitizerEvent);
+          + (UIWindow *)_findKeyWindow {
+              for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                  if (scene.activationState == UISceneActivationStateForegroundActive) {
+                      for (UIWindow *w in scene.windows) {
+                          if (w.isKeyWindow) return w;
+                      }
+                  }
+              }
+              for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                  if (scene.windows.count > 0) return scene.windows.firstObject;
+              }
+              return nil;
+          }
+
+          + (void)_sendTouchX:(double)x y:(double)y phase:(int)phase {
+              if (!g_createDigitizer || !g_createFinger || !g_appendEvent) return;
+              CGSize sz = [self screenSize];
+              double nx = x / sz.width, ny = y / sz.height;
+              uint64_t ts = mach_absolute_time();
+              Boolean touching = (phase != 4);
+              uint32_t mask = kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventPosition | kIOHIDDigitizerEventIdentity;
+
+              IOHIDEventRef digi = g_createDigitizer(kCFAllocatorDefault,ts,kIOHIDTransducerTypeFinger,0,1,mask,0,nx,ny,0,0,0,0,touching,touching,0);
+              IOHIDEventRef finger = g_createFinger(kCFAllocatorDefault,ts,0,1,mask,nx,ny,0,0,0,touching,touching,0);
+              g_appendEvent(digi, finger, 0);
+
+              if (g_bbsRouter && g_routeEventSel && [g_bbsRouter respondsToSelector:g_routeEventSel]) {
+                  #pragma clang diagnostic push
+                  #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                  [g_bbsRouter performSelector:g_routeEventSel withObject:(__bridge id)digi];
+                  #pragma clang diagnostic pop
+              }
+              CFRelease(finger);
+              CFRelease(digi);
           }
 
           + (void)tapAtX:(double)x y:(double)y {
-              // Touch down
-              [self sendTouchEventAtX:x y:y phase:0];
-              // Small delay
-              usleep(80000); // 80ms
-              // Touch up
-              [self sendTouchEventAtX:x y:y phase:4];
+              [self _sendTouchX:x y:y phase:0];
+              usleep(80000);
+              [self _sendTouchX:x y:y phase:4];
           }
 
-          + (void)swipeFromX:(double)fromX fromY:(double)fromY toX:(double)toX toY:(double)toY duration:(double)duration {
-              int steps = (int)(duration * 60); // 60fps
+          + (void)swipeFromX:(double)fx fromY:(double)fy toX:(double)tx toY:(double)ty duration:(double)dur {
+              int steps = (int)(dur * 60);
               if (steps < 5) steps = 5;
-              
-              // Touch down at start
-              [self sendTouchEventAtX:fromX y:fromY phase:0];
+              [self _sendTouchX:fx y:fy phase:0];
               usleep(16000);
-              
-              // Move
               for (int i = 1; i <= steps; i++) {
                   double t = (double)i / steps;
-                  double cx = fromX + (toX - fromX) * t;
-                  double cy = fromY + (toY - fromY) * t;
-                  [self sendTouchEventAtX:cx y:cy phase:2]; // moved
-                  usleep(16000); // ~60fps
+                  [self _sendTouchX:fx+(tx-fx)*t y:fy+(ty-fy)*t phase:2];
+                  usleep(16000);
               }
-              
-              // Touch up at end
-              [self sendTouchEventAtX:toX y:toY phase:4];
+              [self _sendTouchX:tx y:ty phase:4];
           }
 
           + (void)pressHomeButton {
-              // Simulate home button via SpringBoard notification
-              void *sbserv = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_NOW);
-              if (sbserv) {
-                  typedef void (*SBSuspendFunc)(void);
-                  SBSuspendFunc suspendFrontApp = (SBSuspendFunc)dlsym(sbserv, "SBSuspendFrontmostApplication");
-                  if (suspendFrontApp) {
-                      suspendFrontApp();
+              void *sb = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_NOW);
+              if (sb) {
+                  typedef void (*Func)(void);
+                  Func f = (Func)dlsym(sb, "SBSuspendFrontmostApplication");
+                  if (f) f();
+              }
+          }
+
+          + (void)inputText:(NSString *)text {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  for (NSUInteger i = 0; i < text.length; i++) {
+                      NSString *ch = [text substringWithRange:NSMakeRange(i, 1)];
+                      void *gs = dlopen("/System/Library/PrivateFrameworks/GraphicsServices.framework/GraphicsServices", RTLD_NOW);
+                      if (gs) {
+                          typedef void (*SendKeyFunc)(uint16_t, Boolean);
+                          SendKeyFunc sendKey = (SendKeyFunc)dlsym(gs, "GSEventSendKeyEvent");
+                          if (sendKey) {
+                              unichar c = [ch characterAtIndex:0];
+                              sendKey(c, YES);
+                              usleep(20000);
+                              sendKey(c, NO);
+                              usleep(20000);
+                          }
+                      }
+                  }
+              });
+          }
+
+          + (void)openApp:(NSString *)bundleId {
+              void *sb = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_NOW);
+              if (sb) {
+                  typedef int (*LaunchFunc)(CFStringRef);
+                  LaunchFunc launch = (LaunchFunc)dlsym(sb, "SBSLaunchApplicationWithIdentifier");
+                  if (launch) {
+                      launch((__bridge CFStringRef)bundleId);
+                      NSLog(@"iControl: Launched %@", bundleId);
                   }
               }
           }
 
           + (NSDictionary *)deviceInfo {
-              UIDevice *device = [UIDevice currentDevice];
-              CGSize size = [self screenSize];
+              UIDevice *d = [UIDevice currentDevice];
+              CGSize sz = [self screenSize];
+              [d setBatteryMonitoringEnabled:YES];
               return @{
-                  @"name": device.name ?: @"",
-                  @"model": device.model ?: @"",
-                  @"systemName": device.systemName ?: @"",
-                  @"systemVersion": device.systemVersion ?: @"",
-                  @"identifierForVendor": device.identifierForVendor.UUIDString ?: @"",
-                  @"screenWidth": @(size.width),
-                  @"screenHeight": @(size.height),
+                  @"name": d.name ?: @"", @"model": d.model ?: @"",
+                  @"systemName": d.systemName ?: @"", @"systemVersion": d.systemVersion ?: @"",
+                  @"identifierForVendor": d.identifierForVendor.UUIDString ?: @"",
+                  @"screenWidth": @(sz.width), @"screenHeight": @(sz.height),
                   @"scale": @([UIScreen mainScreen].scale),
+                  @"batteryLevel": @(d.batteryLevel), @"batteryState": @(d.batteryState),
+              };
+          }
+
+          + (NSDictionary *)batteryInfo {
+              UIDevice *d = [UIDevice currentDevice];
+              [d setBatteryMonitoringEnabled:YES];
+              NSString *stateStr = @"Unknown";
+              switch (d.batteryState) {
+                  case UIDeviceBatteryStateUnplugged: stateStr = @"Unplugged"; break;
+                  case UIDeviceBatteryStateCharging: stateStr = @"Charging"; break;
+                  case UIDeviceBatteryStateFull: stateStr = @"Full"; break;
+                  default: break;
+              }
+              NSProcessInfo *pi = [NSProcessInfo processInfo];
+              return @{
+                  @"level": @(d.batteryLevel),
+                  @"state": stateStr,
+                  @"thermalState": @(pi.thermalState),
+                  @"lowPowerMode": @(pi.isLowPowerModeEnabled),
               };
           }
 
           + (CGSize)screenSize {
-              return [UIScreen mainScreen].bounds.size;
+              __block CGSize sz;
+              void (^work)(void) = ^{ sz = [UIScreen mainScreen].bounds.size; };
+              if ([NSThread isMainThread]) work();
+              else dispatch_sync(dispatch_get_main_queue(), work);
+              return sz;
           }
-
           @end
 
-          // ========== HTTP Server Implementation ==========
+          // ===== HTTP Server =====
+          @interface HTTPServer : NSObject {
+              int _serverFd;
+          }
+          @property (nonatomic, strong) NSString *statusText;
+          @property (nonatomic, assign) NSInteger requestCount;
+          - (void)startOnPort:(int)port;
+          @end
+
           @implementation HTTPServer
 
           - (void)startOnPort:(int)port {
-              self.statusText = @"Starting...";
-              
               _serverFd = socket(AF_INET, SOCK_STREAM, 0);
-              if (_serverFd < 0) {
-                  self.statusText = [NSString stringWithFormat:@"Failed to create socket: %s", strerror(errno)];
-                  NSLog(@"iControl: socket() failed: %s", strerror(errno));
-                  return;
-              }
-              
+              if (_serverFd < 0) { self.statusText = @"socket() failed"; return; }
               int opt = 1;
               setsockopt(_serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-              
-              struct sockaddr_in addr;
-              memset(&addr, 0, sizeof(addr));
+              struct sockaddr_in addr = {0};
               addr.sin_family = AF_INET;
               addr.sin_addr.s_addr = INADDR_ANY;
               addr.sin_port = htons(port);
-              
               if (bind(_serverFd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-                  self.statusText = [NSString stringWithFormat:@"Failed to bind port %d: %s", port, strerror(errno)];
-                  NSLog(@"iControl: bind() failed: %s", strerror(errno));
-                  close(_serverFd);
-                  return;
+                  self.statusText = [NSString stringWithFormat:@"bind failed: %s", strerror(errno)];
+                  close(_serverFd); return;
               }
-              
-              if (listen(_serverFd, 10) < 0) {
-                  self.statusText = [NSString stringWithFormat:@"Failed to listen: %s", strerror(errno)];
-                  NSLog(@"iControl: listen() failed: %s", strerror(errno));
-                  close(_serverFd);
-                  return;
-              }
-              
+              listen(_serverFd, 20);
               self.statusText = [NSString stringWithFormat:@"Running on port %d", port];
-              NSLog(@"iControl HTTP server listening on port %d (fd=%d)", port, _serverFd);
-              
-              // Use a dedicated POSIX thread for the accept loop
-              self.serverThread = [[NSThread alloc] initWithBlock:^{
-                  NSLog(@"iControl: Accept thread started");
+              NSLog(@"iControl: HTTP server on port %d (fd=%d)", port, _serverFd);
+
+              NSThread *acceptThread = [[NSThread alloc] initWithBlock:^{
                   while (YES) {
-                      struct sockaddr_in clientAddr;
-                      socklen_t clientLen = sizeof(clientAddr);
-                      int clientSocket = accept(self->_serverFd, (struct sockaddr *)&clientAddr, &clientLen);
-                      if (clientSocket < 0) {
-                          NSLog(@"iControl: accept() failed: %s", strerror(errno));
-                          continue;
-                      }
-                      NSLog(@"iControl: Accepted connection (fd=%d)", clientSocket);
-                      
-                      // Handle each client in a new detached thread
-                      NSThread *clientThread = [[NSThread alloc] initWithBlock:^{
-                          [self handleClient:clientSocket];
+                      struct sockaddr_in ca; socklen_t cl = sizeof(ca);
+                      int cs = accept(self->_serverFd, (struct sockaddr *)&ca, &cl);
+                      if (cs < 0) { usleep(10000); continue; }
+                      NSThread *t = [[NSThread alloc] initWithBlock:^{
+                          @autoreleasepool { [self handleClient:cs]; }
                       }];
-                      [clientThread start];
+                      [t start];
                   }
               }];
-              self.serverThread.name = @"iControl-accept";
-              [self.serverThread start];
+              acceptThread.name = @"iControl-accept";
+              [acceptThread start];
           }
 
-          - (void)handleClient:(int)clientSocket {
-              // Set socket timeout
-              struct timeval tv;
-              tv.tv_sec = 10;
-              tv.tv_usec = 0;
-              setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-              
-              char buffer[8192];
-              ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-              NSLog(@"iControl: recv returned %zd bytes (fd=%d)", bytesRead, clientSocket);
-              if (bytesRead <= 0) {
-                  close(clientSocket);
-                  return;
-              }
-              buffer[bytesRead] = '\0';
-              
-              NSString *request = [NSString stringWithUTF8String:buffer];
-              NSArray *lines = [request componentsSeparatedByString:@"\r\n"];
-              if (lines.count == 0) {
-                  close(clientSocket);
-                  return;
-              }
-              
-              NSString *requestLine = lines[0];
-              NSArray *parts = [requestLine componentsSeparatedByString:@" "];
-              if (parts.count < 2) {
-                  close(clientSocket);
-                  return;
-              }
-              
-              NSString *method = parts[0];
-              NSString *path = parts[1];
-              
-              // Parse body for POST requests
-              NSData *bodyData = nil;
-              NSString *bodyString = @"";
-              NSRange bodyRange = [request rangeOfString:@"\r\n\r\n"];
-              if (bodyRange.location != NSNotFound) {
-                  bodyString = [request substringFromIndex:bodyRange.location + 4];
-                  bodyData = [bodyString dataUsingEncoding:NSUTF8StringEncoding];
-              }
-              
-              // Route requests
-              if ([path isEqualToString:@"/status"] || [path isEqualToString:@"/"]) {
-                  [self sendJSON:@{
-                      @"status": @"ready",
-                      @"sessionId": @"icontrol-session",
-                      @"value": [DeviceControl deviceInfo]
-                  } toSocket:clientSocket];
-              }
-              else if ([path isEqualToString:@"/screenshot"]) {
-                  NSData *pngData = [DeviceControl takeScreenshot];
-                  if (pngData) {
-                      [self sendData:pngData contentType:@"image/png" toSocket:clientSocket];
-                  } else {
-                      [self sendJSON:@{@"error": @"screenshot failed"} toSocket:clientSocket statusCode:500];
+          - (void)handleClient:(int)sock {
+              @try {
+                  struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
+                  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                  char buf[16384]; // larger buffer for POST bodies
+                  ssize_t n = recv(sock, buf, sizeof(buf)-1, 0);
+                  if (n <= 0) { close(sock); return; }
+                  buf[n] = '\0';
+                  self.requestCount++;
+
+                  NSString *req = [NSString stringWithUTF8String:buf];
+                  if (!req) { close(sock); return; }
+                  NSArray *lines = [req componentsSeparatedByString:@"\r\n"];
+                  if (lines.count == 0) { close(sock); return; }
+                  NSArray *parts = [lines[0] componentsSeparatedByString:@" "];
+                  if (parts.count < 2) { close(sock); return; }
+
+                  NSString *method = parts[0];
+                  NSString *fullPath = parts[1];
+                  // Split path and query string
+                  NSString *path = fullPath, *query = @"";
+                  NSRange qr = [fullPath rangeOfString:@"?"];
+                  if (qr.location != NSNotFound) {
+                      path = [fullPath substringToIndex:qr.location];
+                      query = [fullPath substringFromIndex:qr.location+1];
                   }
-              }
-              else if ([path isEqualToString:@"/tap"] && [method isEqualToString:@"POST"]) {
-                  NSDictionary *params = [self parseJSON:bodyData];
-                  double x = [params[@"x"] doubleValue];
-                  double y = [params[@"y"] doubleValue];
-                  [DeviceControl tapAtX:x y:y];
-                  [self sendJSON:@{@"status": @"ok"} toSocket:clientSocket];
-              }
-              else if ([path isEqualToString:@"/swipe"] && [method isEqualToString:@"POST"]) {
-                  NSDictionary *params = [self parseJSON:bodyData];
-                  double fromX = [params[@"fromX"] doubleValue];
-                  double fromY = [params[@"fromY"] doubleValue];
-                  double toX = [params[@"toX"] doubleValue];
-                  double toY = [params[@"toY"] doubleValue];
-                  double duration = [params[@"duration"] doubleValue];
-                  if (duration <= 0) duration = 0.3;
-                  [DeviceControl swipeFromX:fromX fromY:fromY toX:toX toY:toY duration:duration];
-                  [self sendJSON:@{@"status": @"ok"} toSocket:clientSocket];
-              }
-              else if ([path isEqualToString:@"/homescreen"] && [method isEqualToString:@"POST"]) {
-                  [DeviceControl pressHomeButton];
-                  [self sendJSON:@{@"status": @"ok"} toSocket:clientSocket];
-              }
-              else if ([path isEqualToString:@"/window/size"]) {
-                  CGSize size = [DeviceControl screenSize];
-                  [self sendJSON:@{
-                      @"width": @(size.width),
-                      @"height": @(size.height),
-                      @"scale": @([UIScreen mainScreen].scale)
-                  } toSocket:clientSocket];
-              }
-              else if ([path isEqualToString:@"/health"]) {
-                  [self sendJSON:@{@"status": @"ok"} toSocket:clientSocket];
-              }
-              else {
-                  [self sendJSON:@{@"error": @"not found", @"path": path} toSocket:clientSocket statusCode:404];
+
+                  // Parse body
+                  NSData *body = nil;
+                  NSRange br = [req rangeOfString:@"\r\n\r\n"];
+                  if (br.location != NSNotFound) {
+                      body = [[req substringFromIndex:br.location+4] dataUsingEncoding:NSUTF8StringEncoding];
+                  }
+
+                  // CORS preflight
+                  if ([method isEqualToString:@"OPTIONS"]) {
+                      NSString *h = @"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n";
+                      send(sock, h.UTF8String, strlen(h.UTF8String), 0);
+                      close(sock); return;
+                  }
+
+                  // === Routes ===
+                  if ([path isEqualToString:@"/"] || [path isEqualToString:@"/status"]) {
+                      [self json:@{@"status":@"ready", @"sessionId":@"icontrol", @"requests":@(self.requestCount), @"value":[DeviceControl deviceInfo]} to:sock];
+                  }
+                  else if ([path isEqualToString:@"/health"]) {
+                      [self json:@{@"status":@"ok", @"uptime":@([[NSProcessInfo processInfo] systemUptime])} to:sock];
+                  }
+                  else if ([path isEqualToString:@"/screenshot"]) {
+                      // Parse ?quality=80&format=jpeg
+                      CGFloat q = 0.8;
+                      BOOL useJPEG = YES;
+                      for (NSString *pair in [query componentsSeparatedByString:@"&"]) {
+                          NSArray *kv = [pair componentsSeparatedByString:@"="];
+                          if (kv.count == 2) {
+                              if ([kv[0] isEqualToString:@"quality"]) q = [kv[1] floatValue] / 100.0;
+                              if ([kv[0] isEqualToString:@"format"] && [kv[1] isEqualToString:@"png"]) useJPEG = NO;
+                          }
+                      }
+                      if (q <= 0 || q > 1) q = 0.8;
+                      NSData *img = useJPEG ? [DeviceControl screenshotJPEG:q] : [DeviceControl screenshotPNG];
+                      if (img) [self data:img type:(useJPEG ? @"image/jpeg" : @"image/png") to:sock];
+                      else [self json:@{@"error":@"screenshot failed"} to:sock code:500];
+                  }
+                  else if ([path isEqualToString:@"/tap"] && [method isEqualToString:@"POST"]) {
+                      NSDictionary *p = [self parseBody:body];
+                      [DeviceControl tapAtX:[p[@"x"] doubleValue] y:[p[@"y"] doubleValue]];
+                      [self json:@{@"status":@"ok"} to:sock];
+                  }
+                  else if ([path isEqualToString:@"/swipe"] && [method isEqualToString:@"POST"]) {
+                      NSDictionary *p = [self parseBody:body];
+                      double dur = [p[@"duration"] doubleValue];
+                      if (dur <= 0) dur = 0.3;
+                      [DeviceControl swipeFromX:[p[@"fromX"] doubleValue] fromY:[p[@"fromY"] doubleValue] toX:[p[@"toX"] doubleValue] toY:[p[@"toY"] doubleValue] duration:dur];
+                      [self json:@{@"status":@"ok"} to:sock];
+                  }
+                  else if ([path isEqualToString:@"/homescreen"] && [method isEqualToString:@"POST"]) {
+                      [DeviceControl pressHomeButton];
+                      [self json:@{@"status":@"ok"} to:sock];
+                  }
+                  else if ([path isEqualToString:@"/input"] && [method isEqualToString:@"POST"]) {
+                      NSDictionary *p = [self parseBody:body];
+                      [DeviceControl inputText:p[@"text"] ?: @""];
+                      [self json:@{@"status":@"ok"} to:sock];
+                  }
+                  else if ([path isEqualToString:@"/open"] && [method isEqualToString:@"POST"]) {
+                      NSDictionary *p = [self parseBody:body];
+                      [DeviceControl openApp:p[@"bundleId"] ?: @""];
+                      [self json:@{@"status":@"ok"} to:sock];
+                  }
+                  else if ([path isEqualToString:@"/battery"]) {
+                      [self json:[DeviceControl batteryInfo] to:sock];
+                  }
+                  else if ([path isEqualToString:@"/window/size"]) {
+                      CGSize sz = [DeviceControl screenSize];
+                      [self json:@{@"width":@(sz.width), @"height":@(sz.height), @"scale":@([UIScreen mainScreen].scale)} to:sock];
+                  }
+                  else {
+                      [self json:@{@"error":@"not found", @"path":path} to:sock code:404];
+                  }
+              } @catch (NSException *e) {
+                  NSLog(@"iControl: handler exception: %@", e);
+                  @try { close(sock); } @catch(id x) {}
               }
           }
 
-          - (NSDictionary *)parseJSON:(NSData *)data {
-              if (!data || data.length == 0) return @{};
-              NSError *error;
-              NSDictionary *dict = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
-              return dict ?: @{};
+          - (NSDictionary *)parseBody:(NSData *)d {
+              if (!d || d.length == 0) return @{};
+              return [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] ?: @{};
           }
 
-          - (void)sendJSON:(NSDictionary *)dict toSocket:(int)sock {
-              [self sendJSON:dict toSocket:sock statusCode:200];
+          - (void)json:(NSDictionary *)dict to:(int)sock { [self json:dict to:sock code:200]; }
+          - (void)json:(NSDictionary *)dict to:(int)sock code:(int)code {
+              NSData *j = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
+              [self data:j type:@"application/json" to:sock code:code];
           }
-
-          - (void)sendJSON:(NSDictionary *)dict toSocket:(int)sock statusCode:(int)code {
-              NSData *jsonData = [NSJSONSerialization dataWithJSONObject:dict options:NSJSONWritingPrettyPrinted error:nil];
-              [self sendData:jsonData contentType:@"application/json" toSocket:sock statusCode:code];
-          }
-
-          - (void)sendData:(NSData *)data contentType:(NSString *)type toSocket:(int)sock {
-              [self sendData:data contentType:type toSocket:sock statusCode:200];
-          }
-
-          - (void)sendData:(NSData *)data contentType:(NSString *)type toSocket:(int)sock statusCode:(int)code {
-              NSString *statusText = (code == 200) ? @"OK" : (code == 404 ? @"Not Found" : @"Error");
-              NSString *header = [NSString stringWithFormat:
-                  @"HTTP/1.1 %d %@\r\n"
-                  @"Content-Type: %@\r\n"
-                  @"Content-Length: %lu\r\n"
-                  @"Access-Control-Allow-Origin: *\r\n"
-                  @"Connection: close\r\n"
-                  @"\r\n",
-                  code, statusText, type, (unsigned long)data.length];
-              
-              NSData *headerData = [header dataUsingEncoding:NSUTF8StringEncoding];
-              send(sock, headerData.bytes, headerData.length, 0);
-              send(sock, data.bytes, data.length, 0);
+          - (void)data:(NSData *)d type:(NSString *)t to:(int)sock { [self data:d type:t to:sock code:200]; }
+          - (void)data:(NSData *)d type:(NSString *)t to:(int)sock code:(int)code {
+              NSString *st = (code==200)?@"OK":(code==404?@"Not Found":@"Error");
+              NSString *h = [NSString stringWithFormat:@"HTTP/1.1 %d %@\r\nContent-Type: %@\r\nContent-Length: %lu\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", code, st, t, (unsigned long)d.length];
+              NSData *hd = [h dataUsingEncoding:NSUTF8StringEncoding];
+              send(sock, hd.bytes, hd.length, 0);
+              // Send body in chunks for large data
+              const uint8_t *ptr = d.bytes;
+              NSUInteger remaining = d.length;
+              while (remaining > 0) {
+                  ssize_t sent = send(sock, ptr, (remaining > 65536 ? 65536 : remaining), 0);
+                  if (sent <= 0) break;
+                  ptr += sent;
+                  remaining -= sent;
+              }
               close(sock);
           }
-
           @end
 
-          // ========== App Delegate Implementation ==========
+          // ===== App Delegate =====
+          @interface AppDelegate : UIResponder <UIApplicationDelegate>
+          @property (strong, nonatomic) UIWindow *window;
+          @property (strong, nonatomic) HTTPServer *server;
+          @property (strong, nonatomic) UILabel *statusLabel;
+          @property (assign, nonatomic) UIBackgroundTaskIdentifier bgTask;
+          @end
+
           @implementation AppDelegate
 
-          - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+          - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts {
+              // Load private APIs once
+              LoadPrivateAPIs();
+
+              // Start background keep-alive
+              [[BackgroundKeepAlive shared] start];
+
               self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-              
               UIViewController *vc = [[UIViewController alloc] init];
-              vc.view.backgroundColor = [UIColor colorWithRed:0.1 green:0.1 blue:0.15 alpha:1.0];
-              
-              // Title
-              UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 80, 350, 40)];
-              titleLabel.text = @"iControl";
-              titleLabel.textColor = [UIColor whiteColor];
-              titleLabel.font = [UIFont boldSystemFontOfSize:32];
-              titleLabel.textAlignment = NSTextAlignmentCenter;
-              [vc.view addSubview:titleLabel];
-              
-              // Status
-              self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 140, 350, 200)];
-              self.statusLabel.textColor = [UIColor colorWithRed:0.4 green:0.9 blue:0.4 alpha:1.0];
-              self.statusLabel.numberOfLines = 0;
-              self.statusLabel.textAlignment = NSTextAlignmentCenter;
-              self.statusLabel.font = [UIFont fontWithName:@"Menlo" size:14];
+              vc.view.backgroundColor = [UIColor colorWithRed:0.08 green:0.08 blue:0.12 alpha:1.0];
+
+              UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 70, UIScreen.mainScreen.bounds.size.width, 40)];
+              title.text = @"iControl"; title.textColor = [UIColor whiteColor];
+              title.font = [UIFont boldSystemFontOfSize:32]; title.textAlignment = NSTextAlignmentCenter;
+              [vc.view addSubview:title];
+
+              self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 130, UIScreen.mainScreen.bounds.size.width-40, 200)];
+              self.statusLabel.textColor = [UIColor colorWithRed:0.3 green:0.9 blue:0.3 alpha:1.0];
+              self.statusLabel.numberOfLines = 0; self.statusLabel.textAlignment = NSTextAlignmentCenter;
+              self.statusLabel.font = [UIFont fontWithName:@"Menlo" size:13];
               [vc.view addSubview:self.statusLabel];
-              
-              // Info
-              UILabel *infoLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 380, 350, 200)];
-              NSDictionary *info = [DeviceControl deviceInfo];
-              infoLabel.text = [NSString stringWithFormat:
-                  @"API Endpoints:\n\n"
-                  @"GET  /status     - Device info\n"
-                  @"GET  /screenshot - PNG screenshot\n"
-                  @"POST /tap        - {x, y}\n"
-                  @"POST /swipe      - {fromX,fromY,toX,toY}\n"
-                  @"POST /homescreen - Press home\n"
-                  @"GET  /health     - Health check\n\n"
-                  @"%@ %@", info[@"systemName"], info[@"systemVersion"]];
-              infoLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
-              infoLabel.numberOfLines = 0;
-              infoLabel.font = [UIFont fontWithName:@"Menlo" size:12];
-              [vc.view addSubview:infoLabel];
-              
+
+              UILabel *info = [[UILabel alloc] initWithFrame:CGRectMake(20, 360, UIScreen.mainScreen.bounds.size.width-40, 300)];
+              info.text = @"API Endpoints:\n\n"
+                  "GET  /status        Device info\n"
+                  "GET  /screenshot    JPEG screenshot\n"
+                  "  ?quality=80&format=png\n"
+                  "POST /tap           {x, y}\n"
+                  "POST /swipe         {fromX,fromY,toX,toY}\n"
+                  "POST /homescreen    Press home\n"
+                  "POST /input         {text}\n"
+                  "POST /open          {bundleId}\n"
+                  "GET  /battery       Battery info\n"
+                  "GET  /health        Health check";
+              info.textColor = [UIColor colorWithWhite:0.5 alpha:1.0];
+              info.numberOfLines = 0; info.font = [UIFont fontWithName:@"Menlo" size:11];
+              [vc.view addSubview:info];
+
               self.window.rootViewController = vc;
               [self.window makeKeyAndVisible];
-              
-              // Keep screen on
               [UIApplication sharedApplication].idleTimerDisabled = YES;
-              
-              // Start server
+
               self.server = [[HTTPServer alloc] init];
-              dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+              dispatch_async(dispatch_get_global_queue(0, 0), ^{
                   [self.server startOnPort:9100];
                   dispatch_async(dispatch_get_main_queue(), ^{
+                      NSDictionary *di = [DeviceControl deviceInfo];
                       self.statusLabel.text = [NSString stringWithFormat:
-                          @"✓ Server Running\n\n"
-                          @"Port: 9100\n\n"
-                          @"Connect via USB:\n"
-                          @"http://localhost:9100/status"];
+                          @"Server Running\n\nPort: 9100\n\n%@ %@\n%@x%@ @%@x\n\nConnect via USB:\nhttp://localhost:9100",
+                          di[@"systemName"], di[@"systemVersion"],
+                          di[@"screenWidth"], di[@"screenHeight"], di[@"scale"]];
                   });
               });
-              
               return YES;
           }
 
+          - (void)applicationDidEnterBackground:(UIApplication *)app {
+              NSLog(@"iControl: entering background");
+              self.bgTask = [app beginBackgroundTaskWithName:@"iControl" expirationHandler:^{
+                  [app endBackgroundTask:self.bgTask];
+                  self.bgTask = UIBackgroundTaskInvalid;
+              }];
+          }
+
+          - (void)applicationWillEnterForeground:(UIApplication *)app {
+              if (self.bgTask != UIBackgroundTaskInvalid) {
+                  [app endBackgroundTask:self.bgTask];
+                  self.bgTask = UIBackgroundTaskInvalid;
+              }
+          }
           @end
 
           int main(int argc, char *argv[]) {
-              @autoreleasepool {
-                  return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class]));
-              }
+              @autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class])); }
           }
           MAIN_EOF
 
-          # Remove leading spaces from heredoc
           sed -i '' 's/^          //' main.m
 
           # ===== Info.plist =====
@@ -522,48 +618,25 @@ jobs:
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-              <key>CFBundleDevelopmentRegion</key>
-              <string>en</string>
-              <key>CFBundleDisplayName</key>
-              <string>iControl</string>
-              <key>CFBundleExecutable</key>
-              <string>iControl</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.icontrol.server</string>
-              <key>CFBundleInfoDictionaryVersion</key>
-              <string>6.0</string>
-              <key>CFBundleName</key>
-              <string>iControl</string>
-              <key>CFBundlePackagType</key>
-              <string>APPL</string>
-              <key>CFBundleShortVersionString</key>
-              <string>1.0</string>
-              <key>CFBundleVersion</key>
-              <string>1</string>
-              <key>LSRequiresIPhoneOS</key>
-              <true/>
-              <key>MinimumOSVersion</key>
-              <string>14.0</string>
-              <key>UIDeviceFamily</key>
-              <array>
-                  <integer>1</integer>
-                  <integer>2</integer>
-              </array>
-              <key>UILaunchStoryboardName</key>
-              <string></string>
+              <key>CFBundleDevelopmentRegion</key><string>en</string>
+              <key>CFBundleDisplayName</key><string>iControl</string>
+              <key>CFBundleExecutable</key><string>iControl</string>
+              <key>CFBundleIdentifier</key><string>com.icontrol.server</string>
+              <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+              <key>CFBundleName</key><string>iControl</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>CFBundleShortVersionString</key><string>2.0</string>
+              <key>CFBundleVersion</key><string>2</string>
+              <key>LSRequiresIPhoneOS</key><true/>
+              <key>MinimumOSVersion</key><string>15.0</string>
+              <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+              <key>UILaunchStoryboardName</key><string></string>
               <key>UISupportedInterfaceOrientations</key>
-              <array>
-                  <string>UIInterfaceOrientationPortrait</string>
-              </array>
+              <array><string>UIInterfaceOrientationPortrait</string></array>
               <key>UIBackgroundModes</key>
-              <array>
-                  <string>audio</string>
-              </array>
+              <array><string>audio</string><string>fetch</string><string>processing</string></array>
               <key>UIApplicationSceneManifest</key>
-              <dict>
-                  <key>UIApplicationSupportsMultipleScenes</key>
-                  <false/>
-              </dict>
+              <dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
           </dict>
           </plist>
           PLIST_EOF
@@ -575,81 +648,56 @@ jobs:
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-              <key>platform-application</key>
-              <true/>
-              <key>com.apple.private.security.no-sandbox</key>
-              <true/>
-              <key>com.apple.private.security.no-container</key>
-              <true/>
-              <key>get-task-allow</key>
-              <true/>
+              <key>platform-application</key><true/>
+              <key>com.apple.private.security.no-sandbox</key><true/>
+              <key>com.apple.private.security.no-container</key><true/>
+              <key>get-task-allow</key><true/>
+              <key>com.apple.backboardd.launchapplications</key><true/>
+              <key>com.apple.backboardd.debugapplications</key><true/>
+              <key>com.apple.springboard.launchapplications</key><true/>
           </dict>
           </plist>
           ENT_EOF
           sed -i '' 's/^          //' entitlements.plist
 
-          echo "Source files created successfully"
-          cat main.m | head -20
+          echo "Source files created"
+          wc -l main.m
 
       - name: Compile for iOS
         run: |
           set -e
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "SDK: $SDK"
-          
-          # Compile
-          clang -arch arm64 \
-            -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
-            -framework UIKit \
-            -framework Foundation \
-            -framework CoreGraphics \
-            -framework ImageIO \
-            -framework MobileCoreServices \
-            -fobjc-arc \
-            -O2 \
-            -o iControl.app/iControl \
-            main.m
-          
+          clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 \
+            -framework UIKit -framework Foundation -framework CoreGraphics \
+            -framework ImageIO -framework MobileCoreServices -framework AVFoundation \
+            -fobjc-arc -O2 -Wno-deprecated-declarations \
+            -o iControl.app/iControl main.m
           echo "Compilation successful"
           file iControl.app/iControl
-          ls -la iControl.app/iControl
 
       - name: Create app bundle
         run: |
           set -e
           cp Info.plist iControl.app/
-          
-          # Create a simple launch image (required for some iOS versions)
-          echo "App bundle contents:"
           ls -la iControl.app/
 
       - name: Sign for TrollStore with ldid
         run: |
           set +e
           brew install ldid
-          
-          # Sign with entitlements
           ldid -Sentitlements.plist iControl.app/iControl
-          LDID_RET=$?
-          
-          if [ $LDID_RET -ne 0 ]; then
-            echo "ldid failed, trying codesign..."
+          if [ $? -ne 0 ]; then
             codesign --force --deep --sign - --entitlements entitlements.plist iControl.app/iControl
           fi
-          
           echo "Signing complete"
-          ldid -e iControl.app/iControl || true
 
       - name: Package IPA
         run: |
           set -e
           mkdir -p Payload
           cp -r iControl.app Payload/
-          
-          # Create IPA
           zip -r iControl-trollstore.ipa Payload/
-          
           echo "IPA created:"
           ls -la iControl-trollstore.ipa
 
