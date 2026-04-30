@@ -22,16 +22,16 @@ jobs:
           #import <UIKit/UIKit.h>
           #import <sys/socket.h>
           #import <netinet/in.h>
-          #import <IOKit/IOKitLib.h>
           #import <dlfcn.h>
           #import <objc/runtime.h>
           #import <ImageIO/ImageIO.h>
           #import <MobileCoreServices/MobileCoreServices.h>
           #import <mach/mach_time.h>
+          #import <CoreFoundation/CoreFoundation.h>
 
           // ========== Private API Declarations ==========
-          // Screenshot
-          extern CGImageRef UIGetScreenImage(void);
+          // Screenshot - loaded dynamically via dlsym
+          typedef CGImageRef (*UIGetScreenImageFunc)(void);
 
           // SpringBoard app launch
           typedef void* FBSOpenApplicationServiceRef;
@@ -41,25 +41,22 @@ jobs:
           typedef struct __IOHIDEvent *IOHIDEventRef;
           typedef uint32_t IOHIDDigitizerTransducerType;
 
-          extern IOHIDEventRef IOHIDEventCreateDigitizerEvent(
-              CFAllocatorRef allocator, uint64_t timeStamp,
-              IOHIDDigitizerTransducerType type,
-              uint32_t index, uint32_t identity, uint32_t eventMask,
-              uint32_t buttonMask,
-              double x, double y, double z,
-              double tipPressure, double barrelPressure, double twist,
-              Boolean range, Boolean touch, uint32_t options);
+          // All IOHIDEvent functions loaded dynamically via dlsym
+          typedef IOHIDEventRef (*IOHIDEventCreateDigitizerEventFunc)(
+              CFAllocatorRef, uint64_t, IOHIDDigitizerTransducerType,
+              uint32_t, uint32_t, uint32_t, uint32_t,
+              double, double, double, double, double, double,
+              Boolean, Boolean, uint32_t);
 
-          extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(
-              CFAllocatorRef allocator, uint64_t timeStamp,
-              uint32_t index, uint32_t identity, uint32_t eventMask,
-              double x, double y, double z,
-              double tipPressure, double twist,
-              Boolean range, Boolean touch, uint32_t options);
+          typedef IOHIDEventRef (*IOHIDEventCreateDigitizerFingerEventFunc)(
+              CFAllocatorRef, uint64_t,
+              uint32_t, uint32_t, uint32_t,
+              double, double, double, double, double,
+              Boolean, Boolean, uint32_t);
 
-          extern void IOHIDEventAppendEvent(IOHIDEventRef parent, IOHIDEventRef child, uint32_t options);
-          extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, int value);
-          extern void IOHIDEventSetSenderID(IOHIDEventRef event, uint64_t senderID);
+          typedef void (*IOHIDEventAppendEventFunc)(IOHIDEventRef, IOHIDEventRef, uint32_t);
+          typedef void (*IOHIDEventSetIntegerValueFunc)(IOHIDEventRef, uint32_t, int);
+          typedef void (*IOHIDEventSetSenderIDFunc)(IOHIDEventRef, uint64_t);
 
           // HID event fields
           #define kIOHIDDigitizerEventTouch     0x01
@@ -95,7 +92,9 @@ jobs:
           @implementation DeviceControl
 
           + (NSData *)takeScreenshot {
-              CGImageRef cgImage = UIGetScreenImage();
+              // Dynamically load private API
+              UIGetScreenImageFunc getScreenImage = (UIGetScreenImageFunc)dlsym(RTLD_DEFAULT, "UIGetScreenImage");
+              CGImageRef cgImage = getScreenImage ? getScreenImage() : NULL;
               if (!cgImage) {
                   // Fallback: capture our own window
                   UIWindow *window = nil;
@@ -128,7 +127,15 @@ jobs:
               Boolean isTouching = (phase != 4); // 4 = ended
               uint32_t eventMask = kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventPosition | kIOHIDDigitizerEventIdentity;
 
-              IOHIDEventRef digitizerEvent = IOHIDEventCreateDigitizerEvent(
+              // Load IOHIDEvent functions dynamically
+              void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+              IOHIDEventCreateDigitizerEventFunc createDigitizer = (IOHIDEventCreateDigitizerEventFunc)dlsym(iokit, "IOHIDEventCreateDigitizerEvent");
+              IOHIDEventCreateDigitizerFingerEventFunc createFinger = (IOHIDEventCreateDigitizerFingerEventFunc)dlsym(iokit, "IOHIDEventCreateDigitizerFingerEvent");
+              IOHIDEventAppendEventFunc appendEvent = (IOHIDEventAppendEventFunc)dlsym(iokit, "IOHIDEventAppendEvent");
+              
+              if (!createDigitizer || !createFinger || !appendEvent) return;
+
+              IOHIDEventRef digitizerEvent = createDigitizer(
                   kCFAllocatorDefault, timestamp,
                   kIOHIDTransducerTypeFinger,
                   0, 1, eventMask, 0,
@@ -136,14 +143,14 @@ jobs:
                   0, 0, 0,
                   isTouching, isTouching, 0);
 
-              IOHIDEventRef fingerEvent = IOHIDEventCreateDigitizerFingerEvent(
+              IOHIDEventRef fingerEvent = createFinger(
                   kCFAllocatorDefault, timestamp,
                   0, 1, eventMask,
                   nx, ny, 0,
                   0, 0,
                   isTouching, isTouching, 0);
 
-              IOHIDEventAppendEvent(digitizerEvent, fingerEvent, 0);
+              appendEvent(digitizerEvent, fingerEvent, 0);
 
               // Try to send via BackBoardServices
               void *bbs = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_NOW);
@@ -573,7 +580,6 @@ jobs:
             -miphoneos-version-min=15.0 \
             -framework UIKit \
             -framework Foundation \
-            -framework IOKit \
             -framework CoreGraphics \
             -framework ImageIO \
             -framework MobileCoreServices \
