@@ -27,6 +27,7 @@ jobs:
           #import <objc/runtime.h>
           #import <ImageIO/ImageIO.h>
           #import <MobileCoreServices/MobileCoreServices.h>
+          #import <mach/mach_time.h>
 
           // ========== Private API Declarations ==========
           // Screenshot
@@ -97,7 +98,15 @@ jobs:
               CGImageRef cgImage = UIGetScreenImage();
               if (!cgImage) {
                   // Fallback: capture our own window
-                  UIWindow *window = [[UIApplication sharedApplication] keyWindow];
+                  UIWindow *window = nil;
+                  for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                      if (scene.activationState == UISceneActivationStateForegroundActive) {
+                          for (UIWindow *w in scene.windows) {
+                              if (w.isKeyWindow) { window = w; break; }
+                          }
+                      }
+                  }
+                  if (!window) window = [UIApplication sharedApplication].windows.firstObject;
                   UIGraphicsBeginImageContextWithOptions(window.bounds.size, NO, [UIScreen mainScreen].scale);
                   [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:YES];
                   UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
