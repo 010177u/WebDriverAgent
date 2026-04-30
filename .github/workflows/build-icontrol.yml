@@ -28,6 +28,8 @@ jobs:
           #import <MobileCoreServices/MobileCoreServices.h>
           #import <mach/mach_time.h>
           #import <CoreFoundation/CoreFoundation.h>
+          #include <errno.h>
+          #include <pthread.h>
 
           // ========== Private API Declarations ==========
           // Screenshot - loaded dynamically via dlsym
@@ -65,10 +67,12 @@ jobs:
           #define kIOHIDTransducerTypeFinger    2
 
           // ========== Simple HTTP Server ==========
-          @interface HTTPServer : NSObject
-          @property (nonatomic, assign) int serverSocket;
-          @property (nonatomic, strong) dispatch_queue_t queue;
+          @interface HTTPServer : NSObject {
+              CFSocketRef _cfSocket;
+              int _serverFd;
+          }
           @property (nonatomic, strong) NSString *statusText;
+          @property (nonatomic, strong) NSThread *serverThread;
           - (void)startOnPort:(int)port;
           @end
 
@@ -242,17 +246,17 @@ jobs:
           @implementation HTTPServer
 
           - (void)startOnPort:(int)port {
-              self.queue = dispatch_queue_create("httpserver", DISPATCH_QUEUE_CONCURRENT);
               self.statusText = @"Starting...";
               
-              self.serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-              if (self.serverSocket < 0) {
-                  self.statusText = @"Failed to create socket";
+              _serverFd = socket(AF_INET, SOCK_STREAM, 0);
+              if (_serverFd < 0) {
+                  self.statusText = [NSString stringWithFormat:@"Failed to create socket: %s", strerror(errno)];
+                  NSLog(@"iControl: socket() failed: %s", strerror(errno));
                   return;
               }
               
               int opt = 1;
-              setsockopt(self.serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+              setsockopt(_serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
               
               struct sockaddr_in addr;
               memset(&addr, 0, sizeof(addr));
@@ -260,38 +264,57 @@ jobs:
               addr.sin_addr.s_addr = INADDR_ANY;
               addr.sin_port = htons(port);
               
-              if (bind(self.serverSocket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-                  self.statusText = [NSString stringWithFormat:@"Failed to bind port %d", port];
-                  close(self.serverSocket);
+              if (bind(_serverFd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+                  self.statusText = [NSString stringWithFormat:@"Failed to bind port %d: %s", port, strerror(errno)];
+                  NSLog(@"iControl: bind() failed: %s", strerror(errno));
+                  close(_serverFd);
                   return;
               }
               
-              if (listen(self.serverSocket, 10) < 0) {
-                  self.statusText = @"Failed to listen";
-                  close(self.serverSocket);
+              if (listen(_serverFd, 10) < 0) {
+                  self.statusText = [NSString stringWithFormat:@"Failed to listen: %s", strerror(errno)];
+                  NSLog(@"iControl: listen() failed: %s", strerror(errno));
+                  close(_serverFd);
                   return;
               }
               
               self.statusText = [NSString stringWithFormat:@"Running on port %d", port];
-              NSLog(@"iControl HTTP server listening on port %d", port);
+              NSLog(@"iControl HTTP server listening on port %d (fd=%d)", port, _serverFd);
               
-              dispatch_async(self.queue, ^{
+              // Use a dedicated POSIX thread for the accept loop
+              self.serverThread = [[NSThread alloc] initWithBlock:^{
+                  NSLog(@"iControl: Accept thread started");
                   while (YES) {
                       struct sockaddr_in clientAddr;
                       socklen_t clientLen = sizeof(clientAddr);
-                      int clientSocket = accept(self.serverSocket, (struct sockaddr *)&clientAddr, &clientLen);
-                      if (clientSocket < 0) continue;
+                      int clientSocket = accept(self->_serverFd, (struct sockaddr *)&clientAddr, &clientLen);
+                      if (clientSocket < 0) {
+                          NSLog(@"iControl: accept() failed: %s", strerror(errno));
+                          continue;
+                      }
+                      NSLog(@"iControl: Accepted connection (fd=%d)", clientSocket);
                       
-                      dispatch_async(self.queue, ^{
+                      // Handle each client in a new detached thread
+                      NSThread *clientThread = [[NSThread alloc] initWithBlock:^{
                           [self handleClient:clientSocket];
-                      });
+                      }];
+                      [clientThread start];
                   }
-              });
+              }];
+              self.serverThread.name = @"iControl-accept";
+              [self.serverThread start];
           }
 
           - (void)handleClient:(int)clientSocket {
+              // Set socket timeout
+              struct timeval tv;
+              tv.tv_sec = 10;
+              tv.tv_usec = 0;
+              setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+              
               char buffer[8192];
               ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+              NSLog(@"iControl: recv returned %zd bytes (fd=%d)", bytesRead, clientSocket);
               if (bytesRead <= 0) {
                   close(clientSocket);
                   return;
@@ -468,13 +491,13 @@ jobs:
               // Start server
               self.server = [[HTTPServer alloc] init];
               dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-                  [self.server startOnPort:8100];
+                  [self.server startOnPort:9100];
                   dispatch_async(dispatch_get_main_queue(), ^{
                       self.statusLabel.text = [NSString stringWithFormat:
                           @"✓ Server Running\n\n"
-                          @"Port: 8100\n\n"
+                          @"Port: 9100\n\n"
                           @"Connect via USB:\n"
-                          @"http://localhost:8100/status"];
+                          @"http://localhost:9100/status"];
                   });
               });
               
@@ -520,7 +543,7 @@ jobs:
               <key>LSRequiresIPhoneOS</key>
               <true/>
               <key>MinimumOSVersion</key>
-              <string>15.0</string>
+              <string>14.0</string>
               <key>UIDeviceFamily</key>
               <array>
                   <integer>1</integer>
@@ -577,7 +600,7 @@ jobs:
           # Compile
           clang -arch arm64 \
             -isysroot "$SDK" \
-            -miphoneos-version-min=15.0 \
+            -miphoneos-version-min=14.0 \
             -framework UIKit \
             -framework Foundation \
             -framework CoreGraphics \
