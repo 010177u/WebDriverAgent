@@ -1,0 +1,171 @@
+# 自定义工作流: 编译 WDA 并彻底修复 ldid 兼容性，适配巨魔 TrollStore
+name: Build WDA for TrollStore
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "16.3"
+
+      - name: Build WebDriverAgent for real device
+        run: |
+          xcodebuild -version
+          
+          xcodebuild build-for-testing \
+            -project WebDriverAgent.xcodeproj \
+            -scheme WebDriverAgentRunner \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ./DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            ARCHS="arm64" \
+            ONLY_ACTIVE_ARCH=NO \
+            2>&1 | tail -20
+          
+          echo "=== Build products ==="
+          find ./DerivedData -name "*.app" -type d
+          find ./DerivedData -name "*.xctest" -type d
+
+      - name: Fix binaries for TrollStore ldid
+        shell: bash
+        run: |
+          set +e  # 不要遇错退出
+          
+          brew install ldid
+          
+          APP_PATH=$(find ./DerivedData -name "WebDriverAgentRunner-Runner.app" -path "*/Debug-iphoneos/*" -type d | head -1)
+          echo "App path: $APP_PATH"
+          
+          echo ""
+          echo "=== Scanning Mach-O files ==="
+          
+          # 找出所有 Mach-O 文件并检查类型
+          find "$APP_PATH" -type f | while read f; do
+            ftype=$(file -b "$f" 2>/dev/null)
+            if echo "$ftype" | grep -qi "Mach-O"; then
+              # 检查是否是 dSYM (调试符号) - ldid 不支持
+              if echo "$ftype" | grep -qi "dSYM"; then
+                echo "REMOVING dSYM: $f"
+                rm -f "$f"
+                continue
+              fi
+              
+              # 检查 Mach-O header type
+              header_type=$(otool -hv "$f" 2>/dev/null | grep -oE "EXECUTE|DYLIB|BUNDLE|DSYM|OBJECT|FVMLIB|CORE|PRELOAD|DYLINKER|FILESET" | head -1)
+              echo "  $f -> type=$header_type arch=$(lipo -archs "$f" 2>/dev/null)"
+              
+              # 删除不支持的类型
+              case "$header_type" in
+                DSYM|OBJECT|CORE|PRELOAD|FILESET)
+                  echo "  -> REMOVING unsupported type: $header_type"
+                  rm -f "$f"
+                  continue
+                  ;;
+              esac
+              
+              # 对 fat binary (arm64+arm64e) 提取 arm64
+              archs=$(lipo -archs "$f" 2>/dev/null || echo "")
+              if echo "$archs" | grep -q "arm64e"; then
+                echo "  -> Thinning to arm64 only"
+                lipo "$f" -thin arm64 -output "${f}.thin" 2>/dev/null
+                if [ $? -eq 0 ] && [ -f "${f}.thin" ]; then
+                  mv "${f}.thin" "$f"
+                else
+                  rm -f "${f}.thin" 2>/dev/null
+                fi
+              fi
+              
+              # 用 ldid 签名测试
+              ldid -S "$f" 2>/dev/null
+              if [ $? -ne 0 ]; then
+                echo "  -> ldid FAILED, trying codesign"
+                codesign --force --sign - "$f" 2>/dev/null || true
+              fi
+            fi
+          done
+          
+          # 删除 metallib 文件
+          find "$APP_PATH" -name "*.metallib" -delete -print 2>/dev/null
+          # 删除 .o 和 .a 文件
+          find "$APP_PATH" -name "*.o" -delete -print 2>/dev/null
+          find "$APP_PATH" -name "*.a" -delete -print 2>/dev/null
+          # 删除 dSYM 目录
+          find "$APP_PATH" -name "*.dSYM" -type d -exec rm -rf {} + 2>/dev/null
+          
+          echo ""
+          echo "=== Testing final ldid -s ==="
+          ldid -s "$APP_PATH" 2>&1
+          LDID_EXIT=$?
+          echo "ldid -s exit: $LDID_EXIT"
+          
+          if [ $LDID_EXIT -ne 0 ]; then
+            echo ""
+            echo "ldid -s still fails. Using codesign as fallback..."
+            codesign --force --deep --sign - "$APP_PATH" 2>&1
+            echo "codesign exit: $?"
+            
+            echo ""
+            echo "=== Remaining Mach-O files ==="
+            find "$APP_PATH" -type f | while read f; do
+              ftype=$(file -b "$f" 2>/dev/null)
+              if echo "$ftype" | grep -qi "Mach-O"; then
+                hdr=$(otool -hv "$f" 2>/dev/null | grep -E "EXECUTE|DYLIB|BUNDLE|DSYM|OBJECT" | head -1)
+                echo "  $f"
+                echo "    type: $ftype"
+                echo "    header: $hdr"
+                ldid -S "$f" 2>&1
+                echo "    ldid: exit=$?"
+              fi
+            done
+          fi
+          
+          echo ""
+          echo "=== Done fixing ==="
+          # 不管 ldid 结果如何，都继续打包（用 codesign 兜底）
+          exit 0
+
+      - name: Package IPA
+        run: |
+          APP_PATH=$(find ./DerivedData -name "WebDriverAgentRunner-Runner.app" -path "*/Debug-iphoneos/*" -type d | head -1)
+          echo "Packaging: $APP_PATH"
+          
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Info.plist")
+          echo "Bundle ID: $BUNDLE_ID"
+          
+          # 确保 xctest 插件在里面
+          XCTEST_PATH=$(find ./DerivedData -name "WebDriverAgentRunner.xctest" -path "*/Debug-iphoneos/*" -type d | head -1)
+          if [ -n "$XCTEST_PATH" ]; then
+            PLUGINS_DIR="$APP_PATH/PlugIns"
+            mkdir -p "$PLUGINS_DIR"
+            if [ ! -d "$PLUGINS_DIR/WebDriverAgentRunner.xctest" ]; then
+              cp -r "$XCTEST_PATH" "$PLUGINS_DIR/"
+              echo "Added xctest plugin"
+            fi
+          fi
+          
+          # 用 codesign 做 ad-hoc 签名 (TrollStore 会重新签名)
+          codesign --force --deep --sign - "$APP_PATH" 2>&1 || true
+          
+          # 创建 IPA
+          mkdir -p Payload
+          cp -r "$APP_PATH" Payload/
+          zip -r WebDriverAgent.ipa Payload/
+          
+          echo "=== IPA Info ==="
+          echo "Bundle ID: $BUNDLE_ID"
+          ls -la WebDriverAgent.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebDriverAgent-TrollStore-IPA
+          path: WebDriverAgent.ipa
+          retention-days: 90
